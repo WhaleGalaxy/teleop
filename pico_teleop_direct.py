@@ -102,6 +102,14 @@ def _mat_mul(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
     return out
 
 
+def _mat_transpose(a: List[List[float]]) -> List[List[float]]:
+    return [
+        [a[0][0], a[1][0], a[2][0]],
+        [a[0][1], a[1][1], a[2][1]],
+        [a[0][2], a[1][2], a[2][2]],
+    ]
+
+
 def _apply_axis_map(vec: List[float], axis_map: List[str]) -> List[float]:
     axes = {"x": vec[0], "y": vec[1], "z": vec[2]}
     out = []
@@ -180,6 +188,10 @@ class PicoTeleopDirect:
         self._kine = None
         # 上一帧目标（用于滤波/限速），按手柄独立保存
         self._last_xyzabc = {}
+        # 参考姿态（用于相对运动），按手柄独立保存
+        self._ref_controller_pose = {}
+        self._ref_target_xyzabc = {}
+        self._ref_target_rot = {}
         # 日志限频用（按手柄独立限频，避免互相抑制）
         self._last_raw_log_time = {}
         self._last_target_log_time = {}
@@ -341,17 +353,6 @@ class PicoTeleopDirect:
             controller, x, y, z, qx, qy, qz, qw,
         )
 
-        # 位置：米 -> 毫米 + 缩放
-        pos_mm = [x * 1000.0 * self.args.scale_xyz,
-              y * 1000.0 * self.args.scale_xyz,
-              z * 1000.0 * self.args.scale_xyz]
-        # 轴映射（适配不同坐标系）
-        pos_mm = _apply_axis_map(pos_mm, self.args.axis_map)
-        # 位置偏移
-        pos_mm = [pos_mm[i] + self.args.offset_xyz_mm[i] for i in range(3)]
-        # 位置限幅
-        pos_mm = self._apply_limits(pos_mm)
-
         # 姿态：四元数 -> 旋转矩阵
         r_vr = _quat_to_rot(qx, qy, qz, qw)
         r_map = [
@@ -359,14 +360,66 @@ class PicoTeleopDirect:
             self.args.r_vr_to_robot[3:6],
             self.args.r_vr_to_robot[6:9],
         ]
+        r_map_t = _mat_transpose(r_map)
         # 额外姿态偏移（欧拉角 -> 旋转矩阵）
         r_offset = _euler_xyz_deg_to_rot(
             self.args.rpy_offset_deg[0],
             self.args.rpy_offset_deg[1],
             self.args.rpy_offset_deg[2],
         )
-        # 组合映射 + 偏移
-        r_target = _mat_mul(r_offset, _mat_mul(r_map, r_vr))
+
+        # 位置：米 -> 毫米 + 缩放
+        pos_mm_abs = [
+            x * 1000.0 * self.args.scale_xyz,
+            y * 1000.0 * self.args.scale_xyz,
+            z * 1000.0 * self.args.scale_xyz,
+        ]
+        pos_mm_abs = _apply_axis_map(pos_mm_abs, self.args.axis_map)
+        pos_mm_abs = [pos_mm_abs[i] + self.args.offset_xyz_mm[i] for i in range(3)]
+
+        if self.args.use_relative:
+            ref = self._ref_controller_pose.get(controller)
+            if ref is None:
+                self._ref_controller_pose[controller] = (x, y, z, qx, qy, qz, qw)
+                # 参考目标：使用当前映射后的绝对值
+                r_target_ref = _mat_mul(r_offset, _mat_mul(r_map, r_vr))
+                self._ref_target_rot[controller] = r_target_ref
+                self._ref_target_xyzabc[controller] = pos_mm_abs + _rot_xyz_to_euler_xyz_deg(r_target_ref)
+                ref = self._ref_controller_pose[controller]
+
+            rx, ry, rz, rqx, rqy, rqz, rqw = ref
+            # 位置增量（VR）
+            delta_pos_mm = [
+                (x - rx) * 1000.0 * self.args.scale_xyz,
+                (y - ry) * 1000.0 * self.args.scale_xyz,
+                (z - rz) * 1000.0 * self.args.scale_xyz,
+            ]
+            delta_pos_mm = _apply_axis_map(delta_pos_mm, self.args.axis_map)
+            base_xyzabc = self._ref_target_xyzabc.get(controller, pos_mm_abs + [0.0, 0.0, 0.0])
+            pos_mm = [base_xyzabc[i] + delta_pos_mm[i] for i in range(3)]
+
+            # 姿态增量（VR） -> 机器人坐标
+            r_vr_ref = _quat_to_rot(rqx, rqy, rqz, rqw)
+            r_delta_vr = _mat_mul(_mat_transpose(r_vr_ref), r_vr)
+            r_delta_robot = _mat_mul(r_map, _mat_mul(r_delta_vr, r_map_t))
+
+            # 可选：缩放旋转增量
+            delta_rpy = _rot_xyz_to_euler_xyz_deg(r_delta_robot)
+            delta_rpy = [self.args.scale_rpy * v for v in delta_rpy]
+            r_delta_scaled = _euler_xyz_deg_to_rot(delta_rpy[0], delta_rpy[1], delta_rpy[2])
+
+            r_target_ref = self._ref_target_rot.get(controller)
+            if r_target_ref is None:
+                r_target_ref = _mat_mul(r_offset, _mat_mul(r_map, r_vr_ref))
+                self._ref_target_rot[controller] = r_target_ref
+            r_target = _mat_mul(r_target_ref, r_delta_scaled)
+        else:
+            # 绝对映射
+            pos_mm = pos_mm_abs
+            r_target = _mat_mul(r_offset, _mat_mul(r_map, r_vr))
+
+        # 位置限幅
+        pos_mm = self._apply_limits(pos_mm)
         # 旋转矩阵 -> 欧拉角（度）
         rpy_deg = _rot_xyz_to_euler_xyz_deg(r_target)
 
@@ -435,16 +488,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--arm-left", default="A") # 双手模式下分别控制左右臂
     parser.add_argument("--arm-right", default="B")
     parser.add_argument("--scale-xyz", type=float, default=1.0)
+    parser.add_argument("--scale-rpy", type=float, default=1.0)
     parser.add_argument("--offset-xyz-mm", nargs=3, type=float, default=[0.0, 0.0, 0.0])
-    parser.add_argument("--axis-map", nargs=3, default=["x", "y", "z"])
+    parser.add_argument("--axis-map", nargs=3, default=["-z", "-x", "y"])
     parser.add_argument(
         "--r-vr-to-robot",
         nargs=9,
         type=float,
         default=[
-            1.0, 0.0, 0.0,
+            0.0, 0.0, -1.0,
+            -1.0, 0.0, 0.0,
             0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,
         ],
         help="3x3 旋转矩阵（按行展开），用于 VR->机器人 坐标映射",
     )
@@ -456,6 +510,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-xyz-mm", nargs=3, type=float, default=[0.0, 0.0, 0.0])
     parser.add_argument("--log-interval", type=float, default=0.5)
     parser.add_argument("--enable-robot", action="store_true", default=False)
+    parser.add_argument("--use-relative", action="store_true", default=True)
     return parser.parse_args()
 
 
